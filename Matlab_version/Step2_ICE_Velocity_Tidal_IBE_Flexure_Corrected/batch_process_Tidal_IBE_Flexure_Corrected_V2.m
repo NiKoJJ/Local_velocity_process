@@ -1,0 +1,226 @@
+  %% InSAR Glacier Velocity Batch Processing
+%  Automatically pairs Range/Azimuth/Geometry files and calls
+%  Tidal_IBE_Flexure_Corrected() for each date pair.
+%
+%  Expected directory layout:
+%    pot/
+%      range/     date1-date2.range-nmt_filtered.tif
+%      azimuth/   date1-date2.azi-nmt_filtered.tif
+%      geometry/  YYYYMMDD.lv_phi.tif
+%                 YYYYMMDD.inc.tif
+%
+%  Geometry fallback:
+%    If date1-specific geometry files are missing, the script
+%    automatically substitutes cfg.geom_fallback_date (e.g. '20170523').
+%    All pairs that used the fallback are listed in the final summary.
+%
+%  Output files (written to cfg.out_vel and cfg.out_vxvy):
+%    date1-date2-range.tif   date1-date2-azimuth.tif
+%    date1-date2-Vgr.tif     date1-date2-Vaz.tif
+%    date1-date2-Vx.tif      date1-date2-Vy.tif
+%    date1-date2-V.tif
+
+clc; clear; close all;
+
+%% =========================================================
+%  1. Global Path & Parameter Configuration
+%% =========================================================
+
+root_dir  = '/data2/Phd_Work1/ICE_Velocity_Process/GAMMA_POT_Output3/Mertz_100m/Remove_outliers_Correction';
+range_dir = fullfile(root_dir, 'range');
+azi_dir   = fullfile(root_dir, 'azimuth');
+geom_dir  = fullfile(root_dir, 'geometry');
+
+% File-name suffixes
+range_suffix = '.range-nmt_filtered';
+azi_suffix   = '.azi-nmt_filtered';
+
+% Fallback geometry date used when date1-specific files are absent
+% Set to '' to disable fallback (pairs with missing geometry are skipped)
+cfg.geom_fallback_date = '20251116';   % e.g. '20170523' | ''
+
+% Auxiliary data
+cfg.nc_tide = 'CATS2008_v2023.nc';  % CATS2008 tidal model
+cfg.nc_era5 = 'ERA5-2015-2025.nc';  % ERA5 surface pressure (for IBE)
+
+% Output directories
+out_root = '/data2/Phd_Work1/ICE_Velocity_Process/GAMMA_POT_Output3/Mertz_100m/Tidal_IBE_Flexure_Correction';
+cfg.out_vel  = fullfile(out_root, 'Corrected_Velocity'); 
+cfg.out_vxvy = fullfile(out_root, 'Vx_Vy_V'); 
+cfg.png      = fullfile(out_root, 'Png'); 
+
+% Grid & projection
+cfg.res          = 100;   % meter !!!!!!!!! change
+
+cfg.epsg_code    = 3031;  
+cfg.unit         = 'year'; % day or year
+
+% IBE correction
+cfg.IBE_warn_thr = 5;    % meter
+cfg.era5_buf     = 0.5;  % degree
+
+% Ice-shelf flexure (Vaughan model)
+cfg.E      = 0.88e9;
+cfg.nu     = 0.3;
+cfg.rho_sw = 1027;
+cfg.g      = 9.81;
+
+cfg.range_suffix = range_suffix;
+
+%% =========================================================
+%  2. Validate Fallback Geometry Files (fail fast)
+%% =========================================================
+
+if ~isempty(cfg.geom_fallback_date)
+    fb_phi = fullfile(geom_dir, [cfg.geom_fallback_date, '.lv_phi.tif']);
+    fb_inc = fullfile(geom_dir, [cfg.geom_fallback_date, '.inc.tif']);
+
+    if ~isfile(fb_phi) || ~isfile(fb_inc)
+        error(['Fallback geometry files not found for date %s.\n' ...
+               '  Expected: %s\n           %s\n' ...
+               'Fix cfg.geom_fallback_date or place the files in %s.'], ...
+               cfg.geom_fallback_date, fb_phi, fb_inc, geom_dir);
+    end
+    fprintf('Fallback geometry : %s\n\n', cfg.geom_fallback_date);
+end
+
+%% =========================================================
+%  3. Discover Range Files
+%% =========================================================
+
+files = dir(fullfile(range_dir, ['*-*', range_suffix, '.tif']));
+
+if isempty(files)
+    error('No range files found in: %s\nPattern: *-*%s.tif', range_dir, range_suffix);
+end
+
+fprintf('Found %d range file(s) to process.\n\n', numel(files));
+
+%% =========================================================
+%  4. Batch Loop
+%% =========================================================
+
+n_ok   = 0;
+n_skip = 0;
+n_fail = 0;
+
+log_fallback = {};   % pairs that ran with fallback geometry
+log_skip     = {};   % pairs that were skipped
+
+for i = 1 : numel(files)
+% for i = 1 : 3
+
+    % ----------------------------------------------------------
+    %  A. Resolve range path and date-pair token
+    % ----------------------------------------------------------
+    range_path = fullfile(range_dir, files(i).name);
+
+    name_parts = split(files(i).name, '.');
+    date_part  = name_parts{1};   % "date1-date2"
+
+    if isempty(regexp(date_part, '^\d{8}-\d{8}$', 'once'))
+        fprintf('[%d/%d] SKIP -- unexpected filename pattern: %s\n', ...
+                i, numel(files), files(i).name);
+        n_skip = n_skip + 1;
+        log_skip{end+1} = files(i).name; %#ok<SAGROW>
+        continue
+    end
+
+    % ----------------------------------------------------------
+    %  B. Build paired file paths
+    % ----------------------------------------------------------
+    azi_path = fullfile(azi_dir, [date_part, azi_suffix, '.tif']);
+
+    t1_str   = date_part(1:8);
+    phi_path = fullfile(geom_dir, [t1_str, '.lv_phi.tif']);
+    inc_path = fullfile(geom_dir, [t1_str, '.inc.tif']);
+
+    % ----------------------------------------------------------
+    %  C. Check azimuth file (no fallback available -- must exist)
+    % ----------------------------------------------------------
+    if ~isfile(azi_path)
+        fprintf('[%d/%d] SKIP %s  (missing azimuth: %s)\n', ...
+                i, numel(files), date_part, azi_path);
+        n_skip = n_skip + 1;
+        log_skip{end+1} = date_part; %#ok<SAGROW>
+        continue
+    end
+
+    % ----------------------------------------------------------
+    %  D. Resolve geometry files with optional fallback
+    %
+    %  Priority:
+    %    1. date1-specific files in geometry/   <- preferred
+    %    2. cfg.geom_fallback_date files        <- automatic substitute
+    %    3. Skip the pair (if fallback disabled)
+    % ----------------------------------------------------------
+    geom_source = t1_str;   % label for logging ('own' or fallback date)
+
+    phi_missing = ~isfile(phi_path);
+    inc_missing = ~isfile(inc_path);
+
+    if phi_missing || inc_missing
+        % Report which specific files are absent
+        fprintf('[%d/%d] Geometry missing for %s:\n', i, numel(files), date_part);
+        if phi_missing; fprintf('         lv_phi not found: %s\n', phi_path); end
+        if inc_missing; fprintf('         inc    not found: %s\n', inc_path); end
+
+        if isempty(cfg.geom_fallback_date)
+            % Fallback disabled -- skip this pair
+            fprintf('         No fallback configured -> SKIP\n\n');
+            n_skip = n_skip + 1;
+            log_skip{end+1} = date_part; %#ok<SAGROW>
+            continue
+        end
+
+        % Apply fallback
+        phi_path    = fullfile(geom_dir, [cfg.geom_fallback_date, '.lv_phi.tif']);
+        inc_path    = fullfile(geom_dir, [cfg.geom_fallback_date, '.inc.tif']);
+        geom_source = cfg.geom_fallback_date;
+
+        fprintf('         Using fallback geometry: %s\n\n', cfg.geom_fallback_date);
+        log_fallback{end+1} = date_part; %#ok<SAGROW>
+    end
+
+    % ----------------------------------------------------------
+    %  E. Call core processing function
+    % ----------------------------------------------------------
+    fprintf('>>> [%d/%d] Processing: %s  (geometry: %s)\n', ...
+            i, numel(files), date_part, geom_source);
+
+    Tidal_IBE_Flexure_Corrected(range_path, azi_path, phi_path, inc_path, cfg);
+
+    % try
+    %     Tidal_IBE_Flexure_Corrected(range_path, azi_path, phi_path, inc_path, cfg);
+    %     n_ok = n_ok + 1;
+    % catch ME
+    %     fprintf('    ERROR -- %s\n    %s\n\n', date_part, ME.message);
+    %     n_fail = n_fail + 1;
+    % end
+
+    close all   % release figures to prevent memory build-up
+
+end % for
+
+%% =========================================================
+%  5. Summary
+%% =========================================================
+fprintf('\n=== Batch Processing Complete ===\n');
+fprintf('  Succeeded : %d\n', n_ok);
+fprintf('  Skipped   : %d\n', n_skip);
+fprintf('  Failed    : %d\n', n_fail);
+fprintf('  Total     : %d\n', numel(files));
+
+if ~isempty(log_fallback)
+    fprintf('\n  Pairs that used fallback geometry (%s):\n', cfg.geom_fallback_date);
+    for k = 1 : numel(log_fallback)
+        fprintf('    - %s\n', log_fallback{k});
+    end
+end
+
+if ~isempty(log_skip)
+    fprintf('\n  Skipped pairs:\n');
+    for k = 1 : numel(log_skip)
+        fprintf('    - %s\n', log_skip{k});
+    end
+end

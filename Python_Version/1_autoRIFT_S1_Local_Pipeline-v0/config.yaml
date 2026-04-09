@@ -1,0 +1,45 @@
+# ============================================================
+#  autoRIFT_S1_Local_Pipeline — 用户配置文件
+# ============================================================
+
+# ── 输入数据 ─────────────────────────────────────────────────
+input:
+  reference_zip: "/data1/PhD_Work1/AutoRIFT3/results/20220906_20220918/S1A_IW_SLC__1SSH_20220906T100810_20220906T100839_044882_055C64_6595.zip"   # 参考景 S1 zip
+  secondary_zip: "/data1/PhD_Work1/AutoRIFT3/results/20220906_20220918/S1A_IW_SLC__1SSH_20220918T100810_20220918T100839_045057_056240_6AC7.zip"   # 次景  S1 zip
+  dem_file:      "/data1/PhD_Work1/AutoRIFT3/results/20220906_20220918/dem_120m.tif"                              # 本地 DEM（UTM 或极地投影）
+  ssm_file:      "/data1/PhD_Work1/autoRIFT_S1_Local_Pipeline-v2/autoRIFT_S1_Local_Pipeline/SPS_0120m_StableSurface.tif"             # 稳定地表掩膜（可选，null=不使用）
+  # ssm_file: null
+
+# ── Burst 选择 ───────────────────────────────────────────────
+burst_selection:
+  swath:       1     # 子幅 IW1 / IW2 / IW3
+  burst_index: 0     # 该子幅内第几个 burst（0-based）
+  # 若已知 ISCE3 格式 burst_id，在此填写并忽略上面两行：
+  burst_id: null     # 例: "t064_135518_iw1"
+
+# ── 轨道文件 ─────────────────────────────────────────────────
+orbit:
+  orbit_dir:       "orbits/"    # 本地轨道文件缓存目录
+  allow_download:  true         # true = 找不到时自动下载；false = 完全离线
+
+# ── 处理参数 ─────────────────────────────────────────────────
+processing:
+  working_dir:   "work/"       # 中间产品目录
+  output_dir:    "output/"     # 最终输出目录
+
+  epsg:  null      # null = 自动从 DEM 读取；显式指定如: 3031（南极）,32654（UTM54N）
+
+  # Geogrid 参数（替代 JPL shapefile 查找）
+  chip_size_min_m:   240    # 最小 chip 尺寸（米），建议 ≥ 16× 像素分辨率
+  chip_size_max_m:   960    # 最大 chip 尺寸（米），建议 4× min
+  search_range_m_yr: 3000   # 最大预期速度（m/yr），用于构建搜索范围栅格
+
+  # autoRIFT 参数
+  filter_type:      "WAL"   # 预处理滤波: WAL=Wallis, HPS=高通, SOB=Sobel
+  filter_width:      21     # Wallis 滤波窗口宽度（像素）
+  oversample_ratio:  64     # 亚像素精细化过采样倍数
+  n_threads:         20     # OpenMP 线程数（OMP_NUM_THREADS）
+
+  # 输出控制
+  save_offsets:  true    # true = 同时保存原始像素偏移量 offset.tif
+  pair_name:     null    # null = 自动由日期生成文件名 

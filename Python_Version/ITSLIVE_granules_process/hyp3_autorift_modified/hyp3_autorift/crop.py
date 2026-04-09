@@ -1,0 +1,396 @@
+# MIT License
+#
+# Copyright (c) 2020 NASA Jet Propulsion Laboratory
+# Modifications (c) Copyright 2023 Alaska Satellite Facility
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Crop HyP3 AutoRIFT products to their valid data range, inplace
+
+This module is based on the ITS_LIVE production script for cropping V2 products
+after they have been generated and has been heavily refactored for use in this HyP3 plugin:
+
+The original script:
+https://github.com/nasa-jpl/its_live_production/blob/957e9aba627be2abafcc9601712a7f9c4dd87849/src/tools/crop_v2_granules.py
+"""
+
+import argparse
+from datetime import timedelta
+from pathlib import Path
+from typing import Hashable
+from urllib.parse import urlparse
+
+import boto3
+import numpy as np
+import pandas as pd
+import pyproj
+import xarray as xr
+from dateutil.parser import parse as parse_dt
+from hyp3lib.aws import upload_file_to_s3
+from tqdm.auto import tqdm
+
+from hyp3_autorift import utils
+
+
+ENCODING_ATTRS = ['_FillValue', 'dtype', 'zlib', 'complevel', 'shuffle', 'add_offset', 'scale_factor']
+CHUNK_SIZE = 512
+PIXEL_SIZE = 120
+
+# time constants
+GPS_EPOCH = '1980-01-06T00:00:00Z'
+TIME_UNITS = f'seconds since {GPS_EPOCH}'
+CALENDAR = 'proleptic_gregorian'
+
+
+def get_aligned_min(val, grid_spacing):
+    """Align a value with the nearest grid posting less than it"""
+    nearest = np.floor(val / grid_spacing) * grid_spacing
+    difference = val - nearest
+    pixel_misalignment = difference % PIXEL_SIZE
+    padding = difference - pixel_misalignment
+    return val - padding, int(padding / 120)
+
+
+def get_aligned_max(val, grid_spacing):
+    """Align a value with the nearest grid posting greater than it"""
+    nearest = np.ceil(val / grid_spacing) * grid_spacing
+    difference = nearest - val
+    pixel_misalignment = difference % PIXEL_SIZE
+    padding = difference - pixel_misalignment
+    return val + padding, int(padding / 120)
+
+
+def get_alignment_info(
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+    grid_spacing: int = CHUNK_SIZE * PIXEL_SIZE,
+):
+    """Get the bounds and additional info necessary for chunk alignment
+
+    Args:
+        x_min: cropped minimum x coordinate
+        y_min: cropped minimum y coordinate
+        x_max: cropped maximum x coordinate
+        y_max: cropped maximum y coordinate
+        grid_spacing: width/height of the chunk in the units of the product's SRS
+
+    Returns:
+        1. aligned bounds
+        2. padding in pixels required to align
+        3. new range of x coordinates
+        4. new range of y coordinates
+    """
+    x_min, left_pad = get_aligned_min(x_min, grid_spacing)
+    y_min, bottom_pad = get_aligned_min(y_min, grid_spacing)
+    x_max, right_pad = get_aligned_max(x_max, grid_spacing)
+    y_max, top_pad = get_aligned_max(y_max, grid_spacing)
+
+    aligned_bounds = [x_min, y_min, x_max, y_max]
+    aligned_padding = [left_pad, bottom_pad, right_pad, top_pad]
+
+    x_values = np.arange(x_min, x_max + PIXEL_SIZE, PIXEL_SIZE)
+    y_values = np.arange(y_min, y_max + PIXEL_SIZE, PIXEL_SIZE)[::-1]
+    return aligned_bounds, aligned_padding, x_values, y_values
+
+
+def numeric_hash(data: Hashable, n_digits: int = 6) -> int:
+    """Calculate a numeric hash value for any hashable data.
+
+    Args:
+        data: hashable data
+        n_digits: max number of digits of the computed hash
+
+    Returns:
+        The numeric hash value
+    """
+    return hash(data) % (10**n_digits)
+
+
+def crop_netcdf_product(netcdf_file: Path) -> Path:
+    """Crop the netCDF product to its valid extent and then pad it such that its
+    chunks will be aligned spatially with other products in the same frame.
+
+    Args:
+        netcdf_file: Path to the netCDF file to crop and align
+
+    Returns:
+        The Path to the cropped netCDF file
+    """
+    with xr.open_dataset(netcdf_file, engine='h5netcdf') as ds:
+        # this will drop X/Y coordinates, so drop non-None values just to get X/Y extends
+        xy_ds = ds.where(ds.v.notnull()).dropna(dim='x', how='all').dropna(dim='y', how='all')
+
+        x_values = xy_ds.x.values
+        grid_x_min, grid_x_max = x_values.min(), x_values.max()
+
+        y_values = xy_ds.y.values
+        grid_y_min, grid_y_max = y_values.min(), y_values.max()
+
+        # Based on X/Y extends, mask original dataset
+        mask_lon = (ds.x >= grid_x_min) & (ds.x <= grid_x_max)
+        mask_lat = (ds.y >= grid_y_min) & (ds.y <= grid_y_max)
+        mask = mask_lon & mask_lat
+
+        cropped_ds = ds.where(mask).dropna(dim='x', how='all').dropna(dim='y', how='all')
+        cropped_ds = cropped_ds.load()
+
+        projection = ds['mapping'].attrs['spatial_epsg']
+
+        aligned_bounds, padding, x_values, y_values = get_alignment_info(grid_x_min, grid_y_min, grid_x_max, grid_y_max)
+
+        grid_x_min, grid_y_min, grid_x_max, grid_y_max = aligned_bounds
+        left_pad, bottom_pad, right_pad, top_pad = padding
+
+        constant_values = {var: ds[var].encoding.get('_FillValue') for var in cropped_ds}
+
+        cropped_ds = cropped_ds.pad(x=(left_pad, right_pad), mode='constant', constant_values=constant_values)
+        cropped_ds = cropped_ds.pad(y=(top_pad, bottom_pad), mode='constant', constant_values=constant_values)
+
+        # Reset data for mapping and img_pair_info data variables as ds.where() extends data of all data variables
+        # to the dimensions of the "mask"
+        cropped_ds['img_pair_info'] = ds['img_pair_info']
+        cropped_ds.drop_vars('mapping')
+
+        if 'time' not in cropped_ds.coords:
+            date_center = parse_dt(cropped_ds['img_pair_info'].date_center)
+
+            # When stacking products in a datacube, xarray and similar tools expect unique times for each array layer.
+            # For all missions, it's theoretically possible to have multiple pairs with the same center date.
+            # For example, for a mission with an 8-day repeat cycle, these pairs will all have a very close center date:
+            #     (0,-8), (+8, -16), (+24, -32), etc.
+            # For Landsat and Sentinel-1, we capture the acquisition time down to the microseconds, so collisions are
+            # unlikely, but for Sentinel-2, we only go down to the seconds. Further complicating things, Sentinel-2
+            # breaks acquisitions up into multiple tile-images, so we can have multiple pairs across S2 tiles with the
+            # exact same times. When building large cubes that cover multiple tiles, collisions are particularly likely.
+            # To prevent collisions, we've considered adding microseconds in these ways:
+            #     1. += 0.LLLAAA where LLL is the longitude and AAA is the latitude
+            #     2. += 0.YYMMDD where YY, MM, DD is the year, month, day of acquisition_date_img1
+            # The benefit of both these methods is that they are easily reversible from metadata in the granules.
+            # However (1) lat,lon isn't necessarily unique (possibly same for (0,-8), (+8, -16), (+24, -32), etc. pairs)
+            # and (2) isn't unique for S2 tiles.
+            #
+            # So, instead, let's add microseconds computed as a numeric hash of the input filename (will be unique) to
+            # "jitter" the mid-date and record it in the time attributes.
+            jitter = numeric_hash(netcdf_file.name)
+
+            # time_units and calendar should be the same as TIME_UNITS and CALENDAR,
+            # but this ensures we use exactly what xarray encodes
+            # see: https://docs.xarray.dev/en/latest/internals/time-coding.html#cf-time-encoding
+            time, time_units, calendar = xr.coding.times.encode_cf_datetime(
+                date_center + timedelta(microseconds=jitter), TIME_UNITS, CALENDAR, dtype=np.dtype('float64')
+            )
+
+            cropped_ds = cropped_ds.assign_coords(time=time)
+            cropped_ds = cropped_ds.expand_dims(dim='time', axis=0)
+            cropped_ds['time'].attrs = {
+                'standard_name': 'time',
+                'description': (
+                    'mid-date between acquisition_date_img1 and acquisition_date_img2 '
+                    'with microseconds added to ensure uniqueness.'
+                ),
+                'units': time_units,
+                'calendar': calendar,
+                'microseconds_added': jitter,
+                'microseconds_added_description': '6-digit numeric hash of the filename.',
+            }
+
+        cropped_ds['mapping'] = ds['mapping']
+
+        cropped_ds['x'] = x_values
+        cropped_ds['y'] = y_values
+
+        cropped_ds['x'].attrs = ds['x'].attrs
+        cropped_ds['y'].attrs = ds['y'].attrs
+
+        # Compute centroid longitude/latitude
+        center_x = (grid_x_min + grid_x_max) / 2
+        center_y = (grid_y_min + grid_y_max) / 2
+
+        # Convert to lon/lat coordinates
+        to_lon_lat_transformer = pyproj.Transformer.from_crs(f'EPSG:{projection}', 'EPSG:4326', always_xy=True)
+
+        # Update centroid information for the granule
+        center_lon_lat = to_lon_lat_transformer.transform(center_x, center_y)
+
+        cropped_ds['img_pair_info'].attrs['latitude'] = round(center_lon_lat[1], 2)
+        cropped_ds['img_pair_info'].attrs['longitude'] = round(center_lon_lat[0], 2)
+
+        # Update mapping.GeoTransform
+        x_cell = x_values[1] - x_values[0]
+        y_cell = y_values[1] - y_values[0]
+
+        # It was decided to keep all values in GeoTransform center-based
+        cropped_ds['mapping'].attrs['GeoTransform'] = f'{x_values[0]} {x_cell} 0 {y_values[0]} 0 {y_cell}'
+
+        dim_chunks_settings = (1, CHUNK_SIZE, CHUNK_SIZE)
+
+        encoding = {}
+        for variable in ds.data_vars.keys():
+            if variable in ['img_pair_info', 'mapping']:
+                continue
+            attributes = {attr: ds[variable].encoding[attr] for attr in ENCODING_ATTRS if attr in ds[variable].encoding}
+            encoding[variable] = attributes
+
+        for _, attributes in encoding.items():
+            if attributes['_FillValue'] is not None:
+                attributes['chunksizes'] = dim_chunks_settings
+
+        cropped_file = netcdf_file.with_stem(f'{netcdf_file.stem}_cropped')
+        cropped_ds.to_netcdf(cropped_file, engine='h5netcdf', unlimited_dims=['time'], encoding=encoding)
+
+    return cropped_file
+
+
+def _nullable_int(argument_string: str) -> int | None:
+    argument_string = argument_string.replace('None', '').strip()
+    return int(argument_string) if argument_string else None
+
+
+def bulk():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument(
+        '--granules-parquet',
+        default='s3://its-live-data/test-space/stac/granules_to_recrop.parquet',
+        help='URI to a parquet file containing granule URIs to generate metadata for',
+    )
+
+    parser.add_argument(
+        '--start-idx', type=_nullable_int, default=0, help='Start index of the granules to generate metadata for.'
+    )
+    parser.add_argument(
+        '--stop-idx', type=_nullable_int, default=None, help='Stop index of the granules to generate metadata for.'
+    )
+    parser.add_argument('--keep', action='store_true', help='Keep all cropped and source granules on disk.')
+
+    hyp3_group = parser.add_argument_group(
+        'HyP3 content bucket',
+        'AWS S3 bucket and prefix to upload cropped product(s) to. Will also be used to find the input granule if '
+        '`netcdf_product` is not provided.',
+    )
+    hyp3_group.add_argument('--bucket')
+    hyp3_group.add_argument('--bucket-prefix', default='')
+
+    parser.add_argument(
+        '--publish-bucket',
+        type=utils.nullable_string,
+        default=None,
+        help='Additionally, publish products to this bucket. Necessary credentials must be provided '
+        'via the `PUBLISH_ACCESS_KEY_ID` and `PUBLISH_SECRET_ACCESS_KEY` environment variables.',
+    )
+
+    args = parser.parse_args()
+
+    df = pd.read_parquet(args.granules_parquet, engine='pyarrow')
+
+    s3 = boto3.client('s3')
+    for granule_bucket, granule_key in tqdm(
+        df.loc[args.start_idx : args.stop_idx, ['bucket', 'key']].itertuples(index=False), initial=args.start_idx
+    ):
+        print(f'Cropping and chunk-aligning s3://{args.publish_bucket}/{granule_key}')
+
+        if granule_key.endswith('_P000.nc'):
+            print(f'Cannot crop product with no valid data: s3://{granule_bucket}/{granule_key}')
+            continue
+
+        netcdf_file = Path.cwd() / Path(granule_key).name
+
+        s3.download_file(Bucket=granule_bucket, Key=granule_key, Filename=netcdf_file)
+
+        cropped = crop_netcdf_product(netcdf_file)
+
+        print(f'Saved the cropped and chunk-aligned product to {cropped}')
+
+        if args.publish_bucket:
+            print(f'Publishing the cropped and chunk-aligned product to s3://{args.publish_bucket}/{granule_key}')
+            utils.upload_file_to_s3_with_publish_access_keys(
+                cropped, args.publish_bucket, str(Path(granule_key).parent), s3_name=netcdf_file.name
+            )
+
+        if not args.keep:
+            cropped.unlink()
+            netcdf_file.unlink(missing_ok=True)
+
+    if args.bucket:
+        cropped_granules = Path.cwd() / f'{Path(args.granules_parquet).stem}_{args.start_idx}-{args.stop_idx}.csv'
+        df.loc[args.start_idx : args.stop_idx, ['bucket', 'key']].to_csv(cropped_granules)
+        print(f'Uploaded CSV of cropped and chunk-aligned products to s3://{args.bucket}/{args.bucket_prefix}')
+        upload_file_to_s3(cropped_granules, args.bucket, args.bucket_prefix)
+
+
+def main():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument(
+        'netcdf_file',
+        type=str,
+        help='Path or URI to the netCDF product to crop and align',
+    )
+
+    hyp3_group = parser.add_argument_group(
+        'HyP3 content bucket',
+        'AWS S3 bucket and prefix to upload cropped product(s) to. Will also be used to find the input granule if '
+        '`netcdf_product` is not provided.',
+    )
+    hyp3_group.add_argument('--bucket')
+    hyp3_group.add_argument('--bucket-prefix', default='')
+
+    parser.add_argument(
+        '--publish-bucket',
+        type=utils.nullable_string,
+        default=None,
+        help='Additionally, publish products to this bucket. Necessary credentials must be provided '
+        'via the `PUBLISH_ACCESS_KEY_ID` and `PUBLISH_SECRET_ACCESS_KEY` environment variables.',
+    )
+
+    args = parser.parse_args()
+
+    if args.netcdf_file.endswith('_P000.nc'):
+        raise ValueError('Cannot crop product with no valid data')
+
+    if args.netcdf_file.startswith('s3://'):
+        parsed_uri = urlparse(args.netcdf_file)
+        netcdf_file = Path.cwd() / Path(parsed_uri.path).name
+
+        s3 = boto3.client('s3')
+        s3.download_file(Bucket=parsed_uri.netloc, Key=parsed_uri.path.lstrip('/'), Filename=netcdf_file)
+    else:
+        parsed_uri = None
+        netcdf_file = Path(args.netcdf_file)
+
+    cropped = crop_netcdf_product(netcdf_file)
+
+    print(f'Saved the cropped and chunk-aligned product to {cropped}')
+
+    if args.bucket:
+        print(f'Uploaded the cropped and chunk-aligned product to s3://{args.bucket}/{args.bucket_prefix}')
+        upload_file_to_s3(cropped, args.bucket, args.bucket_prefix)
+
+    if args.publish_bucket:
+        granule_prefix = utils.get_opendata_prefix(cropped)
+        print(
+            f'Publishing the cropped and chunk-aligned product to s3://{args.publish_bucket}/{granule_prefix}/{netcdf_file.name}'
+        )
+        utils.upload_file_to_s3_with_publish_access_keys(
+            cropped, args.publish_bucket, granule_prefix, s3_name=netcdf_file.name
+        )
+
+
+if __name__ == '__main__':
+    main()
